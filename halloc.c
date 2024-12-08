@@ -32,6 +32,8 @@
 #define USED_MASK 0x1
 
 #define PUT_CUR_INFO(hdr, sz, used) ((hdr)->cur_info = (sz) | (used))
+#define PUT_CUR_USED(hdr, used)                                                \
+  ((hdr)->cur_info = ((hdr)->cur_info & ~USED_MASK) | (used))
 #define PUT_PREV_INFO(hdr, sz, used) ((hdr)->prev_info = (sz) | (used))
 
 #define GET_CUR_SIZE(hdr) ((hdr)->cur_info & SIZE_MASK)
@@ -163,8 +165,6 @@ header_t *heap_extend(size_t size) {
    * that to be the header for the new block. prev_info is already
    * valid so we only need to change cur_info.
    */
-  printf("Repurposing the sentinel (%p)\n", oldbrk);
-
   header_t *blk = (header_t *)((char *)oldbrk - HEADER_SIZE);
   PUT_CUR_INFO(blk, align_size - HEADER_SIZE, 1);
 
@@ -179,17 +179,27 @@ header_t *heap_extend(size_t size) {
 }
 
 void init() {
-  /* Without this initial call, sbrk will misbehave */
-  void *origbrk = sbrk(0);
-  printf("current brk: %p\n", origbrk);
-
   void *block;
   if ((block = sbrk(PAGE_SIZE)) == (void *)-1) {
     fprintf(stderr, "Heap initialization failed: %s\n", strerror(errno));
     exit(1);
   }
 
-  size_t size = PAGE_SIZE - 2 * HEADER_SIZE;
+  /* Without the following code, sbrk will misbehave. */
+  FILE *devnull = fopen("/dev/null", "w");
+  if (!devnull) {
+    fprintf(stderr, "Failed to open /dev/null: %s\n", strerror(errno));
+    exit(1);
+  }
+  fprintf(devnull, "sbrk return: (%p) as old brk\n", block);
+
+  size_t page_size = sbrk(0) - block;
+
+  /*
+   * Subtracting the overhead of header of initial block and
+   * the sentinel block
+   */
+  size_t size = page_size - 2 * HEADER_SIZE;
   header_t *hdr = (header_t *)block;
   PUT_CUR_INFO(hdr, size, 0);
   PUT_PREV_INFO(hdr, 0, 1);
@@ -200,12 +210,13 @@ void init() {
    * It is useful, however, when walking through adjacent blocks using
    * size in header info, so we know where to stop.
    */
-  header_t *sentinel = (header_t *)((char *)block + PAGE_SIZE - HEADER_SIZE);
+  header_t *sentinel = (header_t *)((char *)block + page_size - HEADER_SIZE);
   PUT_CUR_INFO(sentinel, 0, 1);
   PUT_PREV_INFO(sentinel, size, 0);
 
-  // PUT_NEXT_FREE(hdr, sentinel);
-  // PUT_PREV_FREE(hdr, NULL);
+  /* Make sure ptrs to next and prev free block are null */
+  PUT_NEXT_FREE(hdr, NULL);
+  PUT_PREV_FREE(hdr, NULL);
 
   free_list = hdr;
 }
@@ -276,8 +287,6 @@ header_t *free_list_coalesce_prev(header_t *blk) {
   if (!GET_PREV_USED(blk)) {
     /* Because previous is free, coalesce will certainly happen. */
     blk = GET_PREV_ADJ(blk);
-    printf("transformed to coalesce with next: %p, size=%zu, prev size=%zu\n",
-           blk, GET_CUR_SIZE(blk), GET_PREV_SIZE(blk));
     free_list_coalesce_next(blk);
   }
 
@@ -290,10 +299,19 @@ header_t *free_list_coalesce_prev(header_t *blk) {
  */
 void free_list_coalesce(header_t *blk) {
   free_list_coalesce_next(blk);
-  free_list_coalesce_next(GET_PREV_ADJ(blk));
+  free_list_coalesce_prev(blk);
 }
 
-void hfree(void *blk) { (void)blk; }
+void hfree(void *blk) {
+  header_t *hdr = PAYLOAD_TO_HDR_PTR(blk);
+
+  size_t sz = GET_CUR_SIZE(hdr);
+  PUT_CUR_INFO(hdr, sz, 0);
+  PUT_PREV_INFO(GET_NEXT_ADJ(hdr), sz, 0);
+  free_list_add(hdr);
+
+  free_list_coalesce(hdr);
+}
 
 void *halloc(size_t size) {
   size_t align_size = ROUND_UP(size, PAYLOAD_ALIGNMENT);
@@ -302,13 +320,12 @@ void *halloc(size_t size) {
     /*
      * Try to split the block and add the second part to the free list.
      * We also need to mark the first split as used. Size of the block
-     * could be different after the split so we need to preserve that
-     * while setting used to 1.
+     * could be different after the split, and free_list_split will take
+     * care of that by updating the size and preserving the used bit.
      */
     free_list_remove(blk);
+    PUT_CUR_USED(blk, 1);
     free_list_split(blk, align_size);
-    size_t sz = GET_CUR_SIZE(blk);
-    PUT_CUR_INFO(blk, sz, 1);
     return HDR_TO_PAYLOAD_PTR(blk);
   }
 
@@ -319,13 +336,34 @@ void *halloc(size_t size) {
   return HDR_TO_PAYLOAD_PTR(blk);
 }
 
-void test_alloc();
 void test_heap_extension();
 void test_list_split();
 void test_coalesce1();
 void test_coalesce2();
 
-int main() { test_coalesce2(); }
+int main() {
+  init();
+  header_t *firstblk = free_list;
+
+  void *blk1 = malloc(10);
+  void *blk2 = malloc(140000);
+
+  void *blk3 = malloc(3000);
+  void *blk4 = malloc(328);
+  void *blk5 = malloc(1024);
+  void *blk6 = malloc(1024);
+  heap_walk_adjacent(firstblk);
+
+  printf("freeing the first three blocks (%p)\n", blk4);
+  free(blk1);
+  free(blk5);
+  free(blk4);
+  heap_walk_adjacent(firstblk);
+
+  printf("freeing the second 1024 (%p)\n", blk6);
+  free(blk6);
+  heap_walk_adjacent(firstblk);
+}
 
 /*          TESTS           */
 /****************************/
@@ -343,16 +381,11 @@ void test_coalesce1() {
 
   heap_walk_adjacent(firstblk);
   free_list_walk();
-  printf("/******* COALESCE NEXT *******/\n");
-  assert(free_list_coalesce_next(b16_1));
+  printf("/******* COALESCE (%p) *******/\n", b16_1);
+  free_list_coalesce(b16_1);
 
   heap_walk_adjacent(firstblk);
   free_list_walk();
-  printf("/******* COALESCE PREV *******/\n");
-  header_t *coalesced = free_list_coalesce_prev(b16_1);
-  heap_walk_adjacent(firstblk);
-  free_list_walk();
-  assert(coalesced == firstblk);
 }
 
 void test_coalesce2() {
@@ -369,13 +402,13 @@ void test_coalesce2() {
 
   heap_walk_adjacent(firstblk);
   free_list_walk();
-  printf("/******* COALESCE NEXT *******/%p\n", b16_2);
+  printf("/******* COALESCE NEXT (%p) *******/\n", b16_2);
   assert(free_list_coalesce_next(b16_2));
 
   heap_walk_adjacent(firstblk);
   free_list_walk();
-  printf("/******* COALESCE PREV *******/%p\n", b16_2);
-  header_t *coalesced = free_list_coalesce_prev(b16_2);
+  printf("/******* COALESCE PREV (%p) *******/\n", b16_2);
+  free_list_coalesce_prev(b16_2);
   heap_walk_adjacent(firstblk);
   free_list_walk();
 }
@@ -407,35 +440,6 @@ void test_heap_extension() {
     block = (header_t *)((char *)block + HEADER_SIZE + sz);
   }
 
-  free_list_walk();
-}
-
-void test_alloc() {
-  init();
-
-  header_t *firstblk = free_list;
-
-  void *blk = malloc(10);
-  printf("Allocated 10 (%zu) at address: %p\n",
-         GET_CUR_SIZE(PAYLOAD_TO_HDR_PTR(blk)), blk);
-  void *origbrk = sbrk(0);
-  printf("current brk after malloc: %p\n", origbrk);
-
-  blk = malloc(4032);
-  printf("Allocated 4032 (%zu) at address: %p\n",
-         GET_CUR_SIZE(PAYLOAD_TO_HDR_PTR(blk)), blk);
-  heap_walk_adjacent(firstblk);
-  free_list_walk();
-
-  blk = malloc(10);
-  printf("Allocated 10 (%zu) at address: %p\n",
-         GET_CUR_SIZE(PAYLOAD_TO_HDR_PTR(blk)), blk);
-
-  blk = malloc(5000);
-  printf("Allocated 5000 (%zu) at address: %p\n",
-         GET_CUR_SIZE(PAYLOAD_TO_HDR_PTR(blk)), blk);
-
-  heap_walk_adjacent(firstblk);
   free_list_walk();
 }
 
